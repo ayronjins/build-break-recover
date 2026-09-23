@@ -11,9 +11,9 @@ venv/
 *.key
 *.kubeconfig
 id_*
-data/
-evidence/
-sealed/
-open/
-diagnoses/
+/data/
+/evidence/
+/sealed/
+/open/
+/diagnoses/
 .DS_Store

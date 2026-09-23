@@ -1,0 +1,8 @@
+{
+  "_comment": "Public console record. Populate only with verified test-system findings.",
+  "_scope": "Dedicated Build-Break-Recover test system only.",
+  "updated": "",
+  "injected_faults": [],
+  "real_problems_found": [],
+  "open_items": []
+}

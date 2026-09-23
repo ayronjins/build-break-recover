@@ -1,0 +1,398 @@
+# Build-Break-Recover demo application.
+#
+# Design requirement: the failure matrix needs an app where the FAILURE MODE
+# IS AMBIGUOUS from any single evidence plane. A single pod serving static
+# text is useless - every fault looks identical.
+#
+# So this is a 3-tier chain:
+#     frontend  ->  api  ->  database
+#
+# That produces genuinely different signatures:
+#   - api pod killed        -> frontend 5xx, api endpoints empty
+#   - db unreachable        -> api 5xx but api pods HEALTHY (the key case:
+#                              pod status says fine, traces say otherwise)
+#   - network policy drop   -> Hubble shows DENIED verdicts, pods healthy
+#   - cpu stress on api     -> latency climbs, no errors, no restarts
+#
+# Distinguishing those four requires correlating >1 plane, which is exactly
+# what the project is testing.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bbr-demo
+  labels:
+    # Explicit opt-in. Chaos experiments may ONLY target namespaces carrying
+    # this label. Protected namespaces (kube-system, argocd, kyverno,
+    # observability, tetragon) must never have it.
+    chaos.build-break-recover/enabled: "true"
+    pod-security.kubernetes.io/enforce: baseline
+---
+# ------------------------- DATABASE TIER -------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-content
+  namespace: bbr-demo
+data:
+  # Postgres is heavy for a 7.8G box; this stands in as the dependency.
+  # What matters for the experiment is that it is a SEPARATE network hop
+  # that can be delayed, dropped, partitioned or policy-denied.
+  index.json: |
+    {"records":[{"id":1,"item":"alpha"},{"id":2,"item":"beta"},{"id":3,"item":"gamma"}],"source":"database-tier"}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: database
+  namespace: bbr-demo
+  labels:
+    app: database
+    tier: data
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: database
+  template:
+    metadata:
+      labels:
+        app: database
+        tier: data
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: database
+          image: nginx:1.29-alpine
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: content
+              mountPath: /usr/share/nginx/html
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d
+            - name: cache
+              mountPath: /var/cache/nginx
+            - name: run
+              mountPath: /var/run
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}
+            limits: {cpu: 200m, memory: 96Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          readinessProbe:
+            httpGet: {path: /index.json, port: 8080}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /index.json, port: 8080}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: content
+          configMap: {name: db-content}
+        - name: nginx-conf
+          configMap: {name: db-nginx-conf}
+        - name: cache
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-nginx-conf
+  namespace: bbr-demo
+data:
+  default.conf: |
+    server {
+      listen 8080;
+      access_log /dev/stdout;
+      location / {
+        root /usr/share/nginx/html;
+        add_header Content-Type application/json;
+      }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: database
+  namespace: bbr-demo
+spec:
+  selector:
+    app: database
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
+---
+# ------------------------- API TIER -------------------------
+# Calls the database on every request. If that call fails or slows, the API
+# reports it - but the API POD stays healthy. That gap between "pod is fine"
+# and "service is broken" is the core diagnostic challenge.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-code
+  namespace: bbr-demo
+data:
+  app.py: |
+    import json, os, time, urllib.request, urllib.error
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    DB = os.environ.get("DB_URL", "http://database.bbr-demo.svc.cluster.local:8080/index.json")
+    TIMEOUT = float(os.environ.get("DB_TIMEOUT", "2.0"))
+
+    class H(BaseHTTPRequestHandler):
+        def _send(self, code, payload):
+            body = json.dumps(payload).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/healthz":
+                # Liveness deliberately does NOT check the database.
+                # A dependency being down must not make Kubernetes kill this
+                # pod - that would mask the real fault and create a
+                # restart storm that looks like an app bug.
+                return self._send(200, {"status": "ok", "service": "api"})
+
+            if self.path == "/readyz":
+                return self._send(200, {"status": "ready"})
+
+            t0 = time.monotonic()
+            try:
+                with urllib.request.urlopen(DB, timeout=TIMEOUT) as r:
+                    data = json.loads(r.read())
+                ms = round((time.monotonic() - t0) * 1000, 1)
+                return self._send(200, {
+                    "service": "api", "upstream": "database",
+                    "upstream_latency_ms": ms, "records": data.get("records", []),
+                })
+            except urllib.error.URLError as e:
+                ms = round((time.monotonic() - t0) * 1000, 1)
+                print(f"ERROR upstream=database err={e.reason} after={ms}ms", flush=True)
+                return self._send(503, {
+                    "service": "api", "error": "upstream_unavailable",
+                    "upstream": "database", "detail": str(e.reason),
+                    "upstream_latency_ms": ms,
+                })
+            except Exception as e:
+                ms = round((time.monotonic() - t0) * 1000, 1)
+                print(f"ERROR upstream=database err={e} after={ms}ms", flush=True)
+                return self._send(503, {
+                    "service": "api", "error": "upstream_failure",
+                    "detail": str(e), "upstream_latency_ms": ms,
+                })
+
+        def log_message(self, fmt, *a):
+            print("access " + (fmt % a), flush=True)
+
+    ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: bbr-demo
+  labels:
+    app: api
+    tier: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+        tier: backend
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: python:3.12-alpine
+          command: ["python3", "/app/app.py"]
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: DB_URL
+              value: "http://database.bbr-demo.svc.cluster.local:8080/index.json"
+            - name: DB_TIMEOUT
+              value: "2.0"
+          volumeMounts:
+            - name: code
+              mountPath: /app
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 192Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: 8080}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: code
+          configMap: {name: api-code}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: bbr-demo
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
+---
+# ------------------------- FRONTEND TIER -------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-code
+  namespace: bbr-demo
+data:
+  app.py: |
+    import json, os, time, urllib.request, urllib.error
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    API = os.environ.get("API_URL", "http://api.bbr-demo.svc.cluster.local:8080/")
+    TIMEOUT = float(os.environ.get("API_TIMEOUT", "3.0"))
+
+    class H(BaseHTTPRequestHandler):
+        def _send(self, code, payload):
+            body = json.dumps(payload).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path in ("/healthz", "/readyz"):
+                return self._send(200, {"status": "ok", "service": "frontend"})
+            t0 = time.monotonic()
+            try:
+                with urllib.request.urlopen(API, timeout=TIMEOUT) as r:
+                    data = json.loads(r.read())
+                ms = round((time.monotonic() - t0) * 1000, 1)
+                return self._send(200, {
+                    "service": "frontend", "api_latency_ms": ms, "api": data,
+                })
+            except urllib.error.HTTPError as e:
+                ms = round((time.monotonic() - t0) * 1000, 1)
+                print(f"ERROR upstream=api status={e.code} after={ms}ms", flush=True)
+                return self._send(502, {
+                    "service": "frontend", "error": "api_error",
+                    "status": e.code, "api_latency_ms": ms,
+                })
+            except Exception as e:
+                ms = round((time.monotonic() - t0) * 1000, 1)
+                print(f"ERROR upstream=api err={e} after={ms}ms", flush=True)
+                return self._send(502, {
+                    "service": "frontend", "error": "api_unreachable",
+                    "detail": str(e), "api_latency_ms": ms,
+                })
+
+        def log_message(self, fmt, *a):
+            print("access " + (fmt % a), flush=True)
+
+    ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: bbr-demo
+  labels:
+    app: frontend
+    tier: web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+        tier: web
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: frontend
+          image: python:3.12-alpine
+          command: ["python3", "/app/app.py"]
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: API_URL
+              value: "http://api.bbr-demo.svc.cluster.local:8080/"
+          volumeMounts:
+            - name: code
+              mountPath: /app
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 192Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /readyz, port: 8080}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: code
+          configMap: {name: frontend-code}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: bbr-demo
+spec:
+  type: NodePort
+  selector:
+    app: frontend
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30080
+      name: http

@@ -1,0 +1,195 @@
+# Kyverno baseline policies for Build-Break-Recover.
+#
+# These encode the report's rule: "Never weaken security just to make the
+# error disappear." Each policy blocks a specific shortcut an AI under
+# pressure to restore availability might reach for.
+#
+# All are validationFailureAction: Enforce. Audit mode would let the
+# violation through while logging it, which is the appearance of a control
+# rather than a control.
+#
+# Scope: the demo namespace only. System namespaces (kube-system, kyverno,
+# observability) are excluded because Cilium and Tetragon legitimately need
+# privileged access to do eBPF work - that is the "kernel observability is
+# not kernel fault injection" distinction from the report.
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: bbr-disallow-privilege-escalation
+  annotations:
+    policies.kyverno.io/description: >-
+      Blocks privileged containers, privilege escalation, host namespaces and
+      dangerous capabilities. This is the single most likely "fix" an agent
+      would try when a container cannot access something: grant it more
+      power. That must fail at admission.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: no-privileged-containers
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [bbr-demo]
+      validate:
+        message: "DENIED: privileged containers are not permitted. Restoring availability never justifies privilege."
+        pattern:
+          spec:
+            =(initContainers):
+              - =(securityContext):
+                  =(privileged): "false"
+            containers:
+              - =(securityContext):
+                  =(privileged): "false"
+
+    - name: no-privilege-escalation
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [bbr-demo]
+      validate:
+        message: "DENIED: allowPrivilegeEscalation must be false."
+        pattern:
+          spec:
+            containers:
+              - securityContext:
+                  allowPrivilegeEscalation: "false"
+
+    - name: no-host-namespaces
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [bbr-demo]
+      validate:
+        message: "DENIED: hostNetwork, hostPID and hostIPC break the container boundary."
+        pattern:
+          spec:
+            =(hostNetwork): "false"
+            =(hostPID): "false"
+            =(hostIPC): "false"
+
+    - name: no-dangerous-capabilities
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [bbr-demo]
+      validate:
+        message: "DENIED: SYS_ADMIN, NET_ADMIN, SYS_PTRACE and similar capabilities are not permitted."
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.securityContext.capabilities.add[] || `[]` }}"
+                    operator: AnyIn
+                    value: ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYS_MODULE", "ALL", "NET_RAW", "SYS_BOOT"]
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: bbr-disallow-host-path
+  annotations:
+    policies.kyverno.io/description: >-
+      hostPath mounts let a pod read or write the node filesystem, which is
+      a container escape in practice.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: no-hostpath-volumes
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [bbr-demo]
+      validate:
+        message: "DENIED: hostPath volumes are not permitted."
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.volumes[].hostPath || `[]` | length(@) }}"
+                operator: GreaterThan
+                value: 0
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: bbr-require-image-tag
+  annotations:
+    policies.kyverno.io/description: >-
+      Rejects ':latest' and untagged images. A mutable tag makes an incident
+      unreproducible - you cannot tell which code was running when it broke,
+      which destroys the evidence trail the whole project depends on.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: no-latest-tag
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [bbr-demo]
+      validate:
+        message: "DENIED: ':latest' or untagged images make incidents unreproducible. Pin a version."
+        pattern:
+          spec:
+            containers:
+              - image: "!*:latest"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: bbr-require-resource-limits
+  annotations:
+    policies.kyverno.io/description: >-
+      An unbounded container can starve the node and turn a single-workload
+      fault into a cluster-wide outage, contaminating the experiment.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-limits
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [bbr-demo]
+      validate:
+        message: "DENIED: cpu and memory limits are required."
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  limits:
+                    memory: "?*"
+                    cpu: "?*"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: bbr-protect-observability
+  annotations:
+    policies.kyverno.io/description: >-
+      Implements "never disable the sensor to fix the alarm." Blocks deletion
+      or scaling-to-zero of the telemetry stack. Without this, the cheapest
+      way to make an alert stop firing is to kill the thing that fires it.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: protect-telemetry-namespaces
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+              names: [observability, kyverno, kube-system]
+              operations: [DELETE]
+      validate:
+        message: "DENIED: telemetry and policy namespaces must not be deleted. Never disable the sensor to fix the alarm."
+        deny: {}

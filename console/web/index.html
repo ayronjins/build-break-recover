@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build-Break-Recover — Lab Console</title>
+<meta name="description" content="A Kubernetes lab where faults are injected on purpose, an AI diagnoses them blind without access to the answer, and every repair is verified by measurement. Live record of what broke and what fixed it.">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://bbr.ayron.in/">
+<meta property="og:title" content="Build-Break-Recover Lab Console">
+<meta property="og:description" content="Faults injected on purpose. Diagnosed blind. Every repair verified by measurement.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://bbr.ayron.in/">
+<meta name="twitter:card" content="summary">
+<meta name="theme-color" content="#0d1210">
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">BBR</span>
+    <div>
+      <h1>Build-Break-Recover</h1>
+      <p class="tagline">AI-operated controlled-failure and recovery lab</p>
+    </div>
+  </div>
+  <div class="status-cluster">
+    <a href="https://ayron.in/" class="pill" id="author-link" title="Part of Ayron Jins's portfolio">
+      by Ayron Jins &middot; ayron.in
+    </a>
+    <div class="pill" id="autonomy-pill" title="Repair execution is not implemented">
+      <span class="dot dot-safe"></span> AUTONOMY L0 · OBSERVE ONLY
+    </div>
+    <div class="pill" id="conn-pill"><span class="dot" id="conn-dot"></span> <span id="conn-text">connecting…</span></div>
+    <button id="refresh-btn" class="btn">Refresh</button>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button data-view="resolved" class="active">Problems Fixed</button>
+  <button data-view="overview">Overview</button>
+  <button data-view="incidents">Incidents</button>
+  <button data-view="live">Live System</button>
+  <button data-view="network">Network</button>
+  <button data-view="kernel">Kernel &amp; Forensics</button>
+  <button data-view="safety">Safety Center</button>
+  <button data-view="repair">Repair Center</button>
+  <button data-view="about">How It Works</button>
+</nav>
+
+<main id="main">
+  <div class="loading">Loading telemetry…</div>
+</main>
+
+<footer class="footer">
+  <span>Build-Break-Recover test system · Kubernetes on an isolated VM · read-only collector</span>
+  <span id="last-updated"></span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
